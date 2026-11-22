@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paper Plane — Night Flight</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #050914; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="sky"></canvas>
+<script>
+"use strict";
+/*
+ * Paper Plane — Night Flight
+ * One prompt built this game:
+ * "Build a tiny browser game: pilot a paper plane through a night sky,
+ *  dodge storm clouds, catch golden stars, survive 60 seconds."
+ *
+ * Controls: Arrow keys or WASD to steer. Enter / click to start and restart.
+ * Dodge the storm clouds (3 hits and the flight ends), catch golden stars
+ * for points, and stay airborne for the full 60 seconds to win.
+ */
+
+// ---------- deterministic random (seeded, so demo frames are stable) ----------
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- canvas ----------
+const canvas = document.getElementById("sky");
+const ctx = canvas.getContext("2d");
+let W = 0, H = 0;
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+}
+window.addEventListener("resize", resize);
+resize();
+
+// ---------- world constants ----------
+const FLIGHT_SECONDS = 60;
+const PLANE_R = 20;
+const CLOUD_R = 46;
+const STAR_R = 15;
+
+// ---------- input ----------
+const keys = {};
+window.addEventListener("keydown", (e) => {
+  keys[e.key.toLowerCase()] = true;
+  if (["arrowup", "arrowdown", "arrowleft", "arrowright", " "].includes(e.key.toLowerCase())) e.preventDefault();
+  if (e.key === "Enter") advance();
+});
+window.addEventListener("keyup", (e) => { keys[e.key.toLowerCase()] = false; });
+canvas.addEventListener("pointerdown", () => advance());
+
+function steer() {
+  let x = 0, y = 0;
+  if (keys["arrowleft"] || keys["a"]) x -= 1;
+  if (keys["arrowright"] || keys["d"]) x += 1;
+  if (keys["arrowup"] || keys["w"]) y -= 1;
+  if (keys["arrowdown"] || keys["s"]) y += 1;
+  return { x, y };
+}
+
+// ---------- entities ----------
+const plane = { x: 0, y: 0, vx: 0, vy: 0, tilt: 0, invulnUntil: 0 };
+let clouds = [];
+let stars = [];
+let sparkles = [];
+let trail = [];      // fading wind-streak the plane leaves behind
+let backdrop = [];   // parallax star layers
+let shooting = null; // occasional shooting star
+
+function buildBackdrop(rng) {
+  backdrop = [];
+  const layers = [
+    { n: 90, size: 1.1, speed: 6,  alpha: 0.45 },
+    { n: 60, size: 1.8, speed: 14, alpha: 0.7 },
+    { n: 34, size: 2.6, speed: 26, alpha: 1.0 }
+  ];
+  for (const L of layers) {
+    for (let i = 0; i < L.n; i++) {
+      backdrop.push({ x: rng() * W, y: rng() * H, ...L, tw: rng() * Math.PI * 2 });
+    }
+  }
+}
+
+function makeCloud(rng, x) {
+  const puffs = [];
+  const n = 5 + Math.floor(rng() * 3);
+  for (let i = 0; i < n; i++) {
+    puffs.push({ dx: (rng() - 0.5) * 95, dy: (rng() - 0.5) * 34, r: 22 + rng() * 24 });
+  }
+  return { x, y: 60 + rng() * (H - 120), speed: 120 + rng() * 110, puffs, flash: 0 };
+}
+
+function makeStar(rng, x) {
+  return { x, y: 50 + rng() * (H - 100), phase: rng() * Math.PI * 2, taken: false };
+}
+
+// ---------- game state ----------
+let mode = "title";           // title | playing | won | lost
+let timeLeft = FLIGHT_SECONDS;
+let score = 0;
+let caught = 0;
+let lives = 3;
+let elapsed = 0;
+let spawnCloudIn = 0;
+let spawnStarIn = 0;
+const playRng = mulberry32(20261122);
+
+function resetFlight() {
+  plane.x = W * 0.28; plane.y = H * 0.5; plane.vx = 0; plane.vy = 0; plane.tilt = 0;
+  plane.invulnUntil = 0;
+  clouds = []; stars = []; sparkles = []; trail = [];
+  timeLeft = FLIGHT_SECONDS; score = 0; caught = 0; lives = 3; elapsed = 0;
+  spawnCloudIn = 0.4; spawnStarIn = 0.9;
+}
+
+function advance() {
+  if (mode === "title" || mode === "won" || mode === "lost") {
+    resetFlight();
+    mode = "playing";
+  }
+}
+
+// ---------- update ----------
+function update(dt, now) {
+  // backdrop always drifts
+  for (const s of backdrop) {
+    s.x -= s.speed * dt;
+    if (s.x < -4) { s.x = W + 4; s.y = Math.random() * H; }
+  }
+  if (!shooting && Math.random() < dt * 0.12) {
+    shooting = { x: W * (0.35 + Math.random() * 0.6), y: H * Math.random() * 0.3, life: 0 };
+  }
+  if (shooting) {
+    shooting.x -= 620 * dt; shooting.y += 260 * dt; shooting.life += dt;
+    if (shooting.life > 0.9) shooting = null;
+  }
+  if (mode !== "playing") return;
+
+  elapsed += dt;
+  timeLeft = Math.max(0, FLIGHT_SECONDS - elapsed);
+  if (timeLeft <= 0) { mode = "won"; return; }
+
+  const s = steer();
+  const ACCEL = 1500, MAXV = 430;
+  plane.vx += s.x * ACCEL * dt;
+  plane.vy += s.y * ACCEL * dt;
+  plane.vx -= plane.vx * 2.4 * dt;
+  plane.vy -= plane.vy * 2.4 * dt;
+  plane.vx = Math.max(-MAXV, Math.min(MAXV, plane.vx));
+  plane.vy = Math.max(-MAXV, Math.min(MAXV, plane.vy));
+  plane.x = Math.max(30, Math.min(W - 30, plane.x + plane.vx * dt));
+  plane.y = Math.max(30, Math.min(H - 30, plane.y + plane.vy * dt));
+  plane.tilt += ((plane.vy / MAXV) * 0.5 - plane.tilt) * Math.min(1, dt * 8);
+
+  // leave a short wind-streak behind the tail
+  trail.push({ x: plane.x - 26, y: plane.y + 4, life: 0.55 });
+  for (const t of trail) { t.x -= 130 * dt; t.life -= dt; }
+  trail = trail.filter((t) => t.life > 0);
+
+  spawnCloudIn -= dt;
+  if (spawnCloudIn <= 0) { clouds.push(makeCloud(playRng, W + 120)); spawnCloudIn = 0.85 + playRng() * 0.8; }
+  spawnStarIn -= dt;
+  if (spawnStarIn <= 0) { stars.push(makeStar(playRng, W + 60)); spawnStarIn = 1.1 + playRng() * 1.1; }
+
+  for (const c of clouds) {
+    c.x -= c.speed * dt;
+    if (Math.random() < dt * 0.25) c.flash = 0.14;
+    if (c.flash > 0) c.flash -= dt;
+  }
+  clouds = clouds.filter((c) => c.x > -160);
+
+  for (const st of stars) st.x -= 105 * dt;
+  stars = stars.filter((st) => st.x > -50 && !st.taken);
+
+  // star pickups
+  for (const st of stars) {
+    const dx = st.x - plane.x, dy = st.y - plane.y;
+    if (dx * dx + dy * dy < (STAR_R + PLANE_R + 6) ** 2) {
+      st.taken = true; caught++; score += 10;
+      for (let i = 0; i < 10; i++) {
+        sparkles.push({ x: st.x, y: st.y, vx: (Math.random() - 0.5) * 220, vy: (Math.random() - 0.5) * 220, life: 0.45 });
+      }
+    }
+  }
+  // cloud hits
+  if (now > plane.invulnUntil) {
+    for (const c of clouds) {
+      const dx = c.x - plane.x, dy = c.y - plane.y;
+      if (dx * dx + dy * dy < (CLOUD_R + PLANE_R - 8) ** 2) {
+        lives--;
+        plane.invulnUntil = now + 1600;
+        for (let i = 0; i < 14; i++) {
+          sparkles.push({ x: plane.x, y: plane.y, vx: (Math.random() - 0.5) * 300, vy: (Math.random() - 0.5) * 300, life: 0.5, grey: true });
+        }
+        if (lives <= 0) { mode = "lost"; }
+        break;
+      }
+    }
+  }
+  for (const p of sparkles) { p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; }
+  sparkles = sparkles.filter((p) => p.life > 0);
+}
+
+// ---------- drawing ----------
+function drawSky(now) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#070d24");
+  g.addColorStop(0.55, "#0a1430");
+  g.addColorStop(1, "#101d42");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // moon with a soft halo
+  const mx = W * 0.84, my = H * 0.16;
+  const halo = ctx.createRadialGradient(mx, my, 10, mx, my, 150);
+  halo.addColorStop(0, "rgba(240,244,200,0.35)");
+  halo.addColorStop(1, "rgba(240,244,200,0)");
+  ctx.fillStyle = halo;
+  ctx.fillRect(mx - 150, my - 150, 300, 300);
+  ctx.beginPath(); ctx.arc(mx, my, 42, 0, Math.PI * 2);
+  ctx.fillStyle = "#f2eed8"; ctx.fill();
+  ctx.beginPath(); ctx.arc(mx - 14, my - 8, 8, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(190,185,160,0.5)"; ctx.fill();
+  ctx.beginPath(); ctx.arc(mx + 12, my + 14, 6, 0, Math.PI * 2);
+  ctx.fill();
+
+  // parallax starfield
+  for (const s of backdrop) {
+    const tw = 0.65 + 0.35 * Math.sin(now / 700 + s.tw);
+    ctx.globalAlpha = s.alpha * tw;
+    ctx.fillStyle = "#dfe8ff";
+    ctx.fillRect(s.x, s.y, s.size, s.size);
+  }
+  ctx.globalAlpha = 1;
+
+  // shooting star
+  if (shooting) {
+    const a = Math.max(0, 1 - shooting.life / 0.9);
+    const grad = ctx.createLinearGradient(shooting.x, shooting.y, shooting.x + 130, shooting.y - 54);
+    grad.addColorStop(0, "rgba(255,255,255," + (0.9 * a) + ")");
+    grad.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.strokeStyle = grad; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(shooting.x, shooting.y); ctx.lineTo(shooting.x + 130, shooting.y - 54); ctx.stroke();
+  }
+}
+
+function drawCloud(c) {
+  ctx.save();
+  ctx.translate(c.x, c.y);
+  for (const p of c.puffs) {
+    const g = ctx.createRadialGradient(p.dx - 8, p.dy - 10, 4, p.dx, p.dy, p.r);
+    g.addColorStop(0, "#4a5878");
+    g.addColorStop(0.7, "#2c3652");
+    g.addColorStop(1, "#1b2340");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(p.dx, p.dy, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+  if (c.flash > 0) { // distant lightning inside the storm
+    ctx.globalAlpha = Math.min(1, c.flash * 5);
+    ctx.fillStyle = "#ffe9a8";
+    ctx.beginPath();
+    ctx.moveTo(-4, 8); ctx.lineTo(10, 8); ctx.lineTo(2, 26); ctx.lineTo(14, 26); ctx.lineTo(-8, 48); ctx.lineTo(-2, 28); ctx.lineTo(-12, 28);
+    ctx.closePath(); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+function starPath(r) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const rad = i % 2 === 0 ? r : r * 0.45;
+    const a = -Math.PI / 2 + (i * Math.PI) / 5;
+    const px = Math.cos(a) * rad, py = Math.sin(a) * rad;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+
+function drawStar(st, now) {
+  const pulse = 1 + 0.12 * Math.sin(now / 260 + st.phase);
+  ctx.save();
+  ctx.translate(st.x, st.y);
+  ctx.scale(pulse, pulse);
+  ctx.shadowColor = "#ffd94d";
+  ctx.shadowBlur = 22;
+  const g = ctx.createRadialGradient(0, 0, 2, 0, 0, STAR_R);
+  g.addColorStop(0, "#fff3b0");
+  g.addColorStop(0.6, "#ffd94d");
+  g.addColorStop(1, "#f5a623");
+  ctx.fillStyle = g;
+  starPath(STAR_R);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawPlane(now) {
+  const blink = now < plane.invulnUntil && Math.floor(now / 110) % 2 === 0;
+  ctx.save();
+  ctx.translate(plane.x, plane.y + Math.sin(now / 320) * 3);
+  ctx.rotate(plane.tilt);
+  ctx.globalAlpha = blink ? 0.35 : 1;
+  // a paper plane: two folded wings and a keel, lit from above
+  ctx.beginPath(); // top wing
+  ctx.moveTo(30, 0); ctx.lineTo(-22, -17); ctx.lineTo(-10, 0);
+  ctx.closePath();
+  ctx.fillStyle = "#ffffff"; ctx.fill();
+  ctx.beginPath(); // lower wing
+  ctx.moveTo(30, 0); ctx.lineTo(-10, 0); ctx.lineTo(-20, 15);
+  ctx.closePath();
+  ctx.fillStyle = "#c9d4ea"; ctx.fill();
+  ctx.beginPath(); // keel fold
+  ctx.moveTo(30, 0); ctx.lineTo(-10, 0); ctx.lineTo(-4, 7);
+  ctx.closePath();
+  ctx.fillStyle = "#8fa3c8"; ctx.fill();
+  ctx.restore();
+}
+
+function drawTrail() {
+  for (const t of trail) {
+    const a = Math.max(0, t.life / 0.55) * 0.4;
+    ctx.globalAlpha = a;
+    ctx.fillStyle = "#bcd2ff";
+    ctx.beginPath();
+    ctx.arc(t.x, t.y, 3.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawSparkles() {
+  for (const p of sparkles) {
+    ctx.globalAlpha = Math.max(0, p.life / 0.5);
+    ctx.fillStyle = p.grey ? "#9aa7c4" : "#ffd94d";
+    ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+  ctx.fillStyle = "rgba(6,10,26,0.55)";
+  ctx.fillRect(0, 0, W, 58);
+  ctx.fillStyle = "#eaf0ff";
+  ctx.font = "600 24px system-ui, sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("★ " + score, 22, 38);
+  ctx.fillText("✦ " + caught, 140, 38);
+  ctx.textAlign = "right";
+  ctx.fillText("♥ ".repeat(Math.max(0, lives)) + "♡ ".repeat(Math.max(0, 3 - lives)), W - 22, 38);
+  // countdown: a draining golden bar plus the seconds
+  const frac = timeLeft / FLIGHT_SECONDS;
+  ctx.fillStyle = "rgba(255,255,255,0.18)";
+  ctx.fillRect(W / 2 - 160, 20, 320, 14);
+  ctx.fillStyle = "#ffd94d";
+  ctx.fillRect(W / 2 - 160, 20, 320 * frac, 14);
+  ctx.fillStyle = "#eaf0ff";
+  ctx.textAlign = "center";
+  ctx.fillText(Math.ceil(timeLeft) + "s", W / 2, 52 + 14);
+}
+
+function centreText(lines) {
+  ctx.textAlign = "center";
+  let y = H * 0.36;
+  for (const L of lines) {
+    ctx.font = L.font;
+    ctx.fillStyle = L.color;
+    if (L.glow) { ctx.shadowColor = L.glow; ctx.shadowBlur = 26; } else { ctx.shadowBlur = 0; }
+    ctx.fillText(L.text, W / 2, y);
+    y += L.gap;
+  }
+  ctx.shadowBlur = 0;
+}
+
+function draw(now) {
+  drawSky(now);
+  for (const st of stars) drawStar(st, now);
+  for (const c of clouds) drawCloud(c);
+  drawTrail();
+  drawSparkles();
+  if (mode !== "title") drawPlane(now);
+
+  // a low band of night mist for depth along the bottom edge
+  const mist = ctx.createLinearGradient(0, H - 130, 0, H);
+  mist.addColorStop(0, "rgba(140,165,220,0)");
+  mist.addColorStop(1, "rgba(140,165,220,0.13)");
+  ctx.fillStyle = mist;
+  ctx.fillRect(0, H - 130, W, 130);
+
+  if (mode === "playing") drawHUD();
+  if (mode === "title") {
+    // show the plane parked low, clear of the words, under the title
+    plane.x = W / 2; plane.y = H * 0.82; plane.tilt = 0;
+    drawPlane(now);
+    centreText([
+      { text: "PAPER PLANE", font: "800 84px system-ui, sans-serif", color: "#ffffff", glow: "#7fb2ff", gap: 64 },
+      { text: "N I G H T   F L I G H T", font: "600 34px system-ui, sans-serif", color: "#ffd94d", gap: 84 },
+      { text: "Dodge the storm clouds · Catch the golden stars · Survive 60 seconds", font: "400 26px system-ui, sans-serif", color: "#cdd9f6", gap: 52 },
+      { text: "Steer with the arrow keys or WASD", font: "400 22px system-ui, sans-serif", color: "#8fa3c8", gap: 66 },
+      { text: "Press ENTER or click to fly", font: "700 28px system-ui, sans-serif", color: "#ffffff", gap: 0 }
+    ]);
+  }
+  if (mode === "won") {
+    drawHUD();
+    centreText([
+      { text: "YOU MADE IT THROUGH THE NIGHT", font: "800 56px system-ui, sans-serif", color: "#ffffff", glow: "#ffd94d", gap: 70 },
+      { text: "Score " + score + " · " + caught + " stars caught", font: "600 30px system-ui, sans-serif", color: "#ffd94d", gap: 80 },
+      { text: "Press ENTER or click to fly again", font: "700 26px system-ui, sans-serif", color: "#ffffff", gap: 0 }
+    ]);
+  }
+  if (mode === "lost") {
+    drawHUD();
+    centreText([
+      { text: "THE STORM GOT YOU", font: "800 56px system-ui, sans-serif", color: "#ffffff", glow: "#7fb2ff", gap: 70 },
+      { text: "Survived " + Math.floor(elapsed) + "s · Score " + score + " · " + caught + " stars", font: "600 30px system-ui, sans-serif", color: "#cdd9f6", gap: 80 },
+      { text: "Press ENTER or click to try again", font: "700 26px system-ui, sans-serif", color: "#ffffff", gap: 0 }
+    ]);
+  }
+}
+
+// ---------- demo / screenshot hooks ----------
+// ?screen=title|play|win|lose&time=<seconds left>&score=<n>&lives=<n>
+// &px=<0..1>&py=<0..1>&seed=<n>  — composes one stable frame and freezes it.
+const params = new URLSearchParams(location.search);
+const frozen = params.has("screen");
+function composeDemoFrame() {
+  const rng = mulberry32(parseInt(params.get("seed") || "7", 10));
+  buildBackdrop(rng);
+  const screen = params.get("screen");
+  plane.x = W * parseFloat(params.get("px") || "0.30");
+  plane.y = H * parseFloat(params.get("py") || "0.52");
+  plane.tilt = parseFloat(params.get("tilt") || "0.08");
+  score = parseInt(params.get("score") || "0", 10);
+  caught = parseInt(params.get("caught") || "0", 10);
+  lives = parseInt(params.get("lives") || "3", 10);
+  timeLeft = parseFloat(params.get("time") || String(FLIGHT_SECONDS));
+  elapsed = FLIGHT_SECONDS - timeLeft;
+  if (screen === "play" || screen === "win" || screen === "lose") {
+    mode = screen === "play" ? "playing" : screen === "win" ? "won" : "lost";
+    // a believable mid-flight arrangement, placed by hand around the plane
+    clouds = [
+      { ...makeCloud(rng, W * 0.62), y: H * 0.30 },
+      { ...makeCloud(rng, W * 0.80), y: H * 0.68 },
+      { ...makeCloud(rng, W * 0.48), y: H * 0.82 }
+    ];
+    stars = [
+      { ...makeStar(rng, W * 0.44), y: H * 0.40 },
+      { ...makeStar(rng, W * 0.70), y: H * 0.52 },
+      { ...makeStar(rng, W * 0.90), y: H * 0.24 }
+    ];
+    // a composed wind-streak curving away behind the plane
+    trail = [];
+    for (let i = 1; i <= 9; i++) {
+      trail.push({ x: plane.x - 26 - i * 17, y: plane.y + 4 + Math.sin(i * 0.55) * 9 + i * 1.6, life: 0.55 * (1 - i / 11) });
+    }
+  } else {
+    mode = "title";
+  }
+}
+
+// ---------- main loop ----------
+buildBackdrop(mulberry32(99));
+resetFlight();
+mode = "title";
+if (frozen) composeDemoFrame();
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (!frozen) update(dt, now);
+  draw(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
